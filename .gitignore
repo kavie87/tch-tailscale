@@ -1,0 +1,4 @@
+*.bak
+*.tgz
+.DS_Store
+Thumbs.db

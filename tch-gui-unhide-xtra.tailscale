@@ -1,0 +1,451 @@
+#!/bin/sh
+
+if [ "$(basename $0)" = "tch-gui-unhide-xtra.tailscale" -o -z "$FW_BASE" ]; then
+  echo "ERROR: This script must NOT be executed!"
+  echo "       Place it in the same directory as tch-gui-unhide and it will"
+  echo "       be applied automatically when you run tch-gui-unhide."
+  exit
+fi
+
+# The tch-gui-unhide-xtra scripts should output a single line to indicate success or failure
+# as the calling script has left a hanging echo -n. Include a leading space for clarity.
+
+if [ -f /root/tailscale/tailscale -a -z "$XTRAS_REMOVE" ]; then
+  echo " Adding Tailscale support..."
+
+# Extract the applied flags from the tailscale install
+  SERVICE=$(/etc/init.d/tailscale status)
+  RUNNING=$(tailscale debug prefs 2>/dev/null | jsonfilter -e '@.WantRunning')
+  ALIAS=$(tailscale debug prefs 2>/dev/null | jsonfilter -e '@.Hostname')
+  SSH=$(tailscale debug prefs 2>/dev/null | jsonfilter -e '@.RunSSH')
+  ROUTES=$(tailscale debug prefs 2>/dev/null | jsonfilter -e '@.AdvertiseRoutes[*]')
+  SUBNET=$(printf '%s\n' "$ROUTES" | grep -v -e '0.0.0.0/0' -e '::/0' | head -n1)
+  [ -z "$SUBNET" ] && SUBNET=$(tailscale debug prefs 2>/dev/null | jsonfilter -e '@.AdvertiseRoutes[2]')
+  [ -z "$SUBNET" ] && SUBNET=$(ip route | grep br-lan | grep proto | awk '{print $1}')
+  EXIT="0"
+  printf '%s\n' "$ROUTES" | grep -q '0.0.0.0/0' && EXIT="1"
+
+  if [ "$SERVICE" = "running" ]; then
+    SERVICE="1"
+  else
+    SERVICE="0"
+  fi
+
+  if [ "$RUNNING" = "true" ]; then
+    RUNNING="1"
+  else
+    RUNNING="0"
+  fi
+
+  if [ "$SSH" = "true" ]; then
+    SSH="1"
+  else
+    SSH="0"
+  fi
+
+  /etc/init.d/tailscale start > /dev/null 2>&1
+  /etc/init.d/tailscale disable
+
+# Create the tailscale mapping, commitapply, config, card, modal, flags and service
+  cat <<"UCI" > /usr/share/transformer/mappings/uci/tailscale.map
+local config_tailscale = "tailscale"
+
+-- uci.tailscale
+mapper("uci_1to1").registerConfigMap(config_tailscale)
+
+-- uci.tailscale.service
+local tailscale_service = {
+  config = config_tailscale,
+  section = "service",
+  type = "service",
+  options = { "enabled","port" }
+}
+
+mapper("uci_1to1").registerSimpleMap(tailscale_service)
+
+-- uci.tailscale.flags
+local tailscale_flags = {
+  config = config_tailscale,
+  section = "flags",
+  type = "flags",
+  options = { "tsup","reset","alias","subnet","exit","ssh" }
+}
+
+mapper("uci_1to1").registerSimpleMap(tailscale_flags)
+UCI
+  cat <<"CA" > /usr/share/transformer/commitapply/tailscale.ca
+^tailscale%.service /etc/init.d/tailscale reload
+^tailscale%.flags /root/tailscale/flags
+^tailscale /root/tailscale/flags
+CA
+if [ ! -e "/etc/config/tailscale" ]; then
+    
+  cat <<CFG > /etc/config/tailscale
+config tailscale 'service'
+	option enabled "$SERVICE"
+	option port '41641'
+
+config tailscale 'flags'
+	option tsup "$RUNNING"
+	option reset '1'
+	option alias "$ALIAS"
+	option subnet "$SUBNET"
+	option exit "$EXIT"
+	option ssh "$SSH"
+CFG
+fi
+    
+  cat <<"CRD" > /www/cards/004_tailscale.lp
+--pretranslated: do not change this file
+ ngx.print('<style>\
+#tailscaletab .subinfos{margin:2px 0 0 0;padding:0;}\
+#tailscaletab .subinfos>div{\
+	float:none !important;\
+	clear:both !important;\
+	display:block !important;\
+	width:auto !important;\
+	height:17px !important;\
+	line-height:17px !important;\
+	margin:0 !important;\
+	padding:0 0 0 20px !important;\
+}\
+#tailscaletab .subinfos strong{font-size:inherit;font-weight:700;}\
+</style>\
+');
+local ngx = ngx
+
+-- Enable localization
+gettext.textdomain('webui-core')
+
+local ui_helper = require("web.ui_helper")
+local content_helper = require("web.content_helper")
+
+local content = {
+  tailscaleEnabled = "uci.tailscale.service.enabled",
+  port = "uci.tailscale.service.port",
+  TSup = "uci.tailscale.flags.tsup",
+  reset = "uci.tailscale.flags.reset",
+  alias = "uci.tailscale.flags.alias",
+  subnet = "uci.tailscale.flags.subnet",
+  isexit = "uci.tailscale.flags.exit",
+  ssh = "uci.tailscale.flags.ssh",
+}
+content_helper.getExactContent(content)
+
+-- Card should follow live Tailscale prefs (CLI/GUI), not stale UCI copies
+local function ts_pref(expr)
+  local cmd = io.popen("tailscale debug prefs 2>/dev/null | jsonfilter -e '" .. expr .. "'")
+  if not cmd then
+    return ""
+  end
+  local val = cmd:read("*l") or ""
+  cmd:close()
+  return val
+end
+
+local live_ssh = ts_pref("@.RunSSH")
+if live_ssh == "true" then
+  content.ssh = "1"
+elseif live_ssh == "false" then
+  content.ssh = "0"
+end
+
+local live_up = ts_pref("@.WantRunning")
+if live_up == "true" then
+  content.TSup = "1"
+elseif live_up == "false" then
+  content.TSup = "0"
+end
+
+local live_host = ts_pref("@.Hostname")
+if live_host ~= "" then
+  content.alias = live_host
+end
+
+local TSstate = content.tailscaleEnabled or "0"
+local TSup = content.TSup or "0"
+
+if content.ssh == "1" then
+  content.ssh = T"Yes"
+else
+  content.ssh = T"No"
+end
+
+if content.TSup == "1" then
+  content.TSup = T"Yes"
+else
+  content.TSup = T"No"
+end
+
+if content.isexit == "1" then
+  content.isexit = T"Yes"
+else
+  content.isexit = T"No"
+end
+
+local tailscaleStatus
+if TSstate == "1" then
+  tailscaleStatus = T"Enabled"
+else
+  tailscaleStatus = T"Disabled"
+end
+
+ngx.print('\
+<div class="span3" id="tailscaletab">\
+	<div class="smallcard">\
+		'); ngx.print( ui_helper.createCardHeader(T"Tailscale","modals/tailscale-modal.lp",nil,nil,{icon={class="icon-globe"}}) ); ngx.print('\
+		<div class="content card_bg" data-bg-text="&#xf0ac;">\
+			'); ngx.print( ui_helper.createSimpleLight(TSup, T"Tailscale Up: " .. content.TSup) ); ngx.print('\
+			'); ngx.print( ui_helper.createSimpleLight(TSstate, tailscaleStatus) ); ngx.print('\
+');
+
+if TSstate == "1" then
+  ngx.print('\
+			<div class="subinfos">\
+				<div>'); ngx.print(T"Device Alias"..": "); ngx.print('<strong>'); ngx.print(content.alias); ngx.print('</strong></div>\
+				<div>'); ngx.print(T"Subnet route"..": "); ngx.print('<strong>'); ngx.print(content.subnet); ngx.print('</strong></div>\
+				<div>'); ngx.print(T"Exit Node"..": "); ngx.print('<strong>'); ngx.print(content.isexit); ngx.print('</strong></div>\
+				<div>'); ngx.print(T"SSH Enabled"..": "); ngx.print('<strong>'); ngx.print(content.ssh); ngx.print('</strong></div>\
+			</div>\
+')
+end
+
+ngx.print('\
+		</div>\
+	</div>\
+</div>\
+<script>\
+var tsAlias = '); ngx.print(string.format("%q", content.alias or "")); ngx.print(';\
+if(tsAlias){$("#Tailscale_tab").text("Tailscale ").append("<span style=\\"font-size:x-small\\">"+tsAlias+"</span>");}\
+(function(){var $l=$("#tailscaletab .simple-desc").first();if($l.length){$l.html($l.html().replace(/(Yes|No)\\s*$/,"<span style=\\"font-weight:700;font-size:inherit\\">$1</span>"));}}\
+)();\
+</script>\
+');
+CRD
+  cat <<"MOD" > /www/docroot/modals/tailscale-modal.lp
+--pretranslated: do not change this file
+
+-- Localization
+gettext.textdomain('webui-core')
+
+local ngx = ngx
+local ui_helper = require("web.ui_helper")
+local message_helper = require("web.uimessage_helper")
+local post_helper = require("web.post_helper")
+
+local qry_params = {
+  tailscaleEnabled = "uci.tailscale.service.enabled",
+  port = "uci.tailscale.service.port",
+  TSup = "uci.tailscale.flags.tsup",
+  alias = "uci.tailscale.flags.alias",
+  subnet = "uci.tailscale.flags.subnet",
+  isexit = "uci.tailscale.flags.exit",
+  reset = "uci.tailscale.flags.reset",
+  ssh = "uci.tailscale.flags.ssh",
+}
+
+local qry_valid = {
+  tailscaleEnabled = post_helper.validateBoolean,
+  port = post_helper.validateStringIsPort,
+  TSup = post_helper.validateBoolean,
+  alias = post_helper.validateNonEmptyString,
+  subnet = post_helper.validateIPAndSubnet(4),
+  isexit = post_helper.validateBoolean,
+  reset = post_helper.validateBoolean,
+  ssh = post_helper.validateBoolean,
+}
+
+local qry_data,qry_helpmsg = post_helper.handleQuery(qry_params,qry_valid)
+
+local function ts_pref(expr)
+  local cmd = io.popen("tailscale debug prefs 2>/dev/null | jsonfilter -e '" .. expr .. "'")
+  if not cmd then
+    return ""
+  end
+  local val = cmd:read("*l") or ""
+  cmd:close()
+  return val
+end
+
+-- Reset is one-shot: apply with this save, then always show Off
+qry_data["reset"] = "0"
+
+-- CLI `tailscale up --ssh` does not write UCI. On GET, show live prefs so
+-- saving the modal persists ssh/tsup/alias and flags cannot turn SSH off.
+if ngx.var.request_method ~= "POST" then
+  local live_ssh = ts_pref("@.RunSSH")
+  if live_ssh == "true" then
+    qry_data["ssh"] = "1"
+  elseif live_ssh == "false" then
+    qry_data["ssh"] = "0"
+  end
+  local live_up = ts_pref("@.WantRunning")
+  if live_up == "true" then
+    qry_data["TSup"] = "1"
+  elseif live_up == "false" then
+    qry_data["TSup"] = "0"
+  end
+  local live_host = ts_pref("@.Hostname")
+  if live_host ~= "" then
+    qry_data["alias"] = live_host
+  end
+end
+
+ngx.print(ui_helper.createHeader(T"TailScale",false,true),'\
+<div class="modal-body update">\
+  <form class="form-horizontal" method="post" action="modals/tailscale-modal.lp">\
+  ',ui_helper.createMessages(message_helper.popMessages()),'\
+    <fieldset>\
+      <legend>',T"Service",'</legend>',
+        ui_helper.createSwitch(T"Enabled","tailscaleEnabled",qry_data["tailscaleEnabled"],nil,qry_helpmsg["tailscaleEnabled"]),
+        ui_helper.createInputText(T"Port","port",qry_data["port"],nil,qry_helpmsg["port"]),
+      '\
+    </fieldset>\
+    <fieldset>\
+      <legend>',T"Flags",'</legend>',
+        ui_helper.createSwitch(T"Tailscale Up","TSup",qry_data["TSup"],nil,qry_helpmsg["TSup"]),
+        ui_helper.createInputText(T"Alias","alias",qry_data["alias"],nil,qry_helpmsg["alias"]),
+        ui_helper.createInputText(T"Subnet","subnet",qry_data["subnet"],nil,qry_helpmsg["subnet"]),
+        ui_helper.createSwitch(T"Exit Node","isexit",qry_data["isexit"],nil,qry_helpmsg["isexit"]),
+        ui_helper.createSwitch(T"Reset","reset",qry_data["reset"],nil,qry_helpmsg["reset"]),
+        ui_helper.createSwitch(T"SSH","ssh",qry_data["ssh"],nil,qry_helpmsg["ssh"]),
+      '\
+    </fieldset>\
+  </form>\
+</div>\
+',ui_helper.createFooter())
+MOD
+  cat <<"FLG" > /root/tailscale/flags
+#!/bin/sh
+
+TSBIN="/usr/sbin/tailscale"
+[ -x "$TSBIN" ] || TSBIN="/root/tailscale/tailscale"
+
+RESET=$(uci -q get tailscale.flags.reset)
+ALIAS=$(uci -q get tailscale.flags.alias)
+SUBNET=$(uci -q get tailscale.flags.subnet)
+EXIT=$(uci -q get tailscale.flags.exit)
+SSH=$(uci -q get tailscale.flags.ssh)
+TSUP=$(uci -q get tailscale.flags.tsup)
+
+# MagicDNS hostnames cannot contain spaces; keep GUI and Tailscale in sync
+ALIAS=$(printf '%s' "$ALIAS" | sed 's/[[:space:]]\+/-/g')
+uci -q set tailscale.flags.alias="$ALIAS"
+
+if [ "$TSUP" = "0" ]; then
+    logger -t tailscale-flags "tailscale down"
+    "$TSBIN" down
+    uci -q set tailscale.flags.reset="0"
+    uci -q commit tailscale
+    exit 0
+fi
+
+LIVE_HOST=$("$TSBIN" debug prefs 2>/dev/null | jsonfilter -e '@.Hostname')
+
+RESET_ARG=""
+# --reset is required to rename; also honour the one-shot GUI switch
+if [ "$RESET" = "1" ] || [ -n "$ALIAS" -a "$LIVE_HOST" != "$ALIAS" ]; then
+    RESET_ARG="--reset"
+fi
+uci -q set tailscale.flags.reset="0"
+uci -q commit tailscale
+
+if [ "$EXIT" = "0" ]; then
+    EXIT_ARG="--advertise-exit-node=false"
+else
+    EXIT_ARG="--advertise-exit-node"
+fi
+
+# Missing ssh UCI must not disable Tailscale SSH (CLI does not write UCI)
+if [ "$SSH" = "0" ]; then
+    SSH_ARG="--ssh=false"
+else
+    SSH_ARG="--ssh"
+fi
+
+logger -t tailscale-flags "tailscale up $RESET_ARG $EXIT_ARG --advertise-routes=$SUBNET --hostname=$ALIAS $SSH_ARG"
+
+"$TSBIN" up $RESET_ARG $EXIT_ARG --advertise-routes="$SUBNET" --hostname="$ALIAS" $SSH_ARG
+FLG
+  cat <<"SRV" > /etc/init.d/tailscale
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=01
+USE_PROCD=1
+
+. $IPKG_INSTROOT/lib/functions.sh
+
+start_service() {
+	local enabled=$(uci_get tailscale service enabled 0)
+	local port=$(uci_get tailscale service port 41641)
+
+	/usr/sbin/tailscaled --cleanup --state /root/tailscale/tailscaled.state
+
+	if [ "$enabled" == "1" ] ; then
+		uci_toggle_state "tailscale" "service" "Enabled"
+		procd_open_instance
+		procd_set_param command /usr/sbin/tailscaled
+
+		# Set the port to listen on for incoming VPN packets.
+		# Remote nodes will automatically be informed about the new port number,
+		# but you might want to configure this in order to set external firewall
+		# settings.
+		procd_append_param command --port $port
+
+        # update firewall
+		uci -q set $(uci -q show firewall | grep -E "Allow-Tailscale" | cut -d. -f1-2).dest_port=$port
+
+		# OpenWRT /var is a symlink to /tmp, so write persistent state elsewhere.
+		procd_append_param command --state /root/tailscale/tailscaled.state
+		
+		procd_set_param respawn
+		procd_set_param stdout 1
+		procd_set_param stderr 1
+		procd_close_instance
+	else
+		 uci_toggle_state "tailscale" "service" "Disabled"
+	fi
+}
+
+stop_service() {
+	local enabled=$(uci_get tailscale service enabled 0)
+
+	if [ "$enabled" == "0" ] ; then
+		/usr/sbin/tailscale down
+		/usr/sbin/tailscaled --cleanup --state /root/tailscale/tailscaled.state
+		# kill -9 `pgrep tailscale -f`
+	fi
+}
+SRV
+
+  chmod 644 /usr/share/transformer/mappings/uci/tailscale.map
+  chmod 644 /usr/share/transformer/commitapply/tailscale.ca
+  chmod 644 /etc/config/tailscale
+  chmod 644 /www/cards/004_tailscale.lp
+  chmod 644 /www/docroot/modals/tailscale-modal.lp
+  chmod 755 /root/tailscale/flags
+  chmod 755 /etc/init.d/tailscale
+
+  # Persist live SSH/Up into UCI after flags is in place, so CA cannot turn SSH off
+  uci -q set tailscale.flags.ssh="$SSH"
+  uci -q set tailscale.flags.tsup="$RUNNING"
+  uci -q commit tailscale
+
+  /etc/init.d/tailscale enable
+  /etc/init.d/tailscale start > /dev/null 2>&1
+
+  SRV_transformer=$(( $SRV_transformer + 1 ))
+
+# Update the tailscale keep file as necessary
+  MAP="/usr/share/transformer/mappings/uci/tailscale.map"
+  CA="/usr/share/transformer/commitapply/tailscale.ca"
+  KEEP="/lib/upgrade/keep.d/tailscale"
+  if ! grep -q "$MAP.*$CA" "$KEEP"; then
+    sed -i -e "\$a$MAP" "$KEEP"
+    sed -i -e "\$a$CA" "$KEEP"
+  fi
+
+else
+  echo " SKIPPED - /root/tailscale/tailscale not found"
+fi
